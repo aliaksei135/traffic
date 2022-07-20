@@ -1,19 +1,19 @@
-import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    List,
+    Optional,
+    Protocol,
+    Tuple,
+    TypedDict,
+    Union,
+)
 
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
 import pyproj
-
-from ..core.geodesy import destination
-
-if sys.version_info >= (3, 8):
-    from typing import Protocol, TypedDict
-else:
-    from typing_extensions import Protocol, TypedDict
-
 
 if TYPE_CHECKING:
     from cartopy import crs
@@ -43,52 +43,6 @@ class GenerationProtocol(Protocol):
         self, n_samples: int
     ) -> Tuple[npt.NDArray[np.float_], npt.NDArray[np.float_]]:
         ...
-
-
-def compute_latlon_from_xy(
-    data: pd.DataFrame,
-    projection: Union[pyproj.Proj, "crs.Projection", None] = None,
-) -> pd.DataFrame:
-    """Enrich a DataFrame with new longitude and latitude columns computed
-    from x and y columns.
-
-    The default source projection is a Lambert Conformal Conical projection
-    centred on the data inside the dataframe.
-    The destination projection is WGS84 (EPSG 4326).
-
-    .. warning::
-
-        Make sure to use as source projection the one used to compute ``'x'``
-        and ``'y'`` columns in the first place.
-    """
-
-    from cartopy import crs
-
-    if not set(["x", "y"]).issubset(set(data.columns)):
-        raise ValueError("DataFrame should contains 'x' and 'y' columns.")
-
-    if isinstance(projection, crs.Projection):
-        projection = pyproj.Proj(projection.proj4_init)
-
-    if projection is None:
-        projection = pyproj.Proj(
-            proj="lcc",
-            ellps="WGS84",
-            lat_1=data.y.min(),
-            lat_2=data.y.max(),
-            lat_0=data.y.mean(),
-            lon_0=data.x.mean(),
-        )
-
-    transformer = pyproj.Transformer.from_proj(
-        projection, pyproj.Proj("epsg:4326"), always_xy=True
-    )
-    lon, lat = transformer.transform(
-        data.x.values,
-        data.y.values,
-    )
-
-    return data.assign(latitude=lat, longitude=lon)
 
 
 class Coordinates(TypedDict):
@@ -125,6 +79,8 @@ def compute_latlon_from_trackgs(
         Whether the coordinates correspond to the first or the last
         coordinates of the trajectories.
     """
+
+    from ..core.geodesy import destination
 
     df = data.copy(deep=True)
     if not forward:
@@ -206,7 +162,7 @@ class Generation:
         X = np.stack(list(f.data[self.features].values.ravel() for f in t))
         if self.scaler is not None:
             X = self.scaler.fit_transform(X)
-        return X
+        return X  # type: ignore
 
     def build_traffic(
         self,
@@ -243,7 +199,8 @@ class Generation:
         # if relevant, enriches DataFrame with latitude and longitude columns.
         if not set(["latitude", "longitude"]).issubset(set(self.features)):
             if set(["x", "y"]).issubset(self.features):
-                df = compute_latlon_from_xy(df, projection=projection)
+                return Traffic(df).compute_latlon_from_xy(projection)
+                # df = compute_latlon_from_xy(df, projection=projection)
             if set(["track", "groundspeed"]).issubset(set(self.features)):
                 assert (
                     coordinates is not None

@@ -13,6 +13,7 @@ from typing import (
     Callable,
     Dict,
     List,
+    Literal,
     Optional,
     Union,
     cast,
@@ -22,6 +23,7 @@ from typing import (
 from tqdm.rich import tqdm
 
 import numpy as np
+import pandas as pd
 
 from .flight import Flight
 from .mixins import GeographyMixin
@@ -31,6 +33,8 @@ if TYPE_CHECKING:
     from typing_extensions import Literal
 
     from .traffic import Traffic  # noqa: F401
+
+_log = logging.getLogger(__name__)
 
 
 class FaultCatcher:
@@ -254,18 +258,30 @@ class LazyTraffic:
                     cumul.append(future.result())
 
         # return Traffic.from_flights
-        result = self.wrapped_t.__class__.from_flights(
-            [flight for flight in cumul if flight is not None]
-        )
+        if len(cumul) == 0 or all(elt is None for elt in cumul):
+            result = None
+        elif any(isinstance(elt, Flight) for elt in cumul):
+            result = self.wrapped_t.__class__.from_flights(
+                [flight for flight in cumul if flight is not None]
+            )
+        elif any(isinstance(elt, dict) for elt in cumul):
+            result = pd.DataFrame.from_records(
+                [elt for elt in cumul if elt is not None]
+            )
+        else:
+            result = pd.concat(cumul)
 
         if cache_file is not None and result is not None:
-            result.to_pickle(cache_file)
+            if Path(cache_file).suffix == ".parquet":
+                result.to_parquet(cache_file)
+            else:
+                result.to_pickle(cache_file)
 
         return result
 
     def __getattr__(self, name: str) -> Any:
         if hasattr(self.wrapped_t, name):
-            logging.warning(
+            _log.warning(
                 ".eval() has been automatically appended for you.\n"
                 "Check the documentation for more options."
             )
@@ -344,9 +360,9 @@ It should be safe to create a proper named function and pass it to filter_if.
             op_idx = LazyLambda(f.__name__, idx_name, *args, **kwargs)
 
             if any(is_lambda(arg) for arg in args):
-                logging.warning(msg.format(method=f.__name__))
+                _log.warning(msg.format(method=f.__name__))
             if any(is_lambda(arg) for arg in kwargs.values()):
-                logging.warning(msg.format(method=f.__name__))
+                _log.warning(msg.format(method=f.__name__))
 
             return LazyTraffic(
                 lazy.wrapped_t,
@@ -383,9 +399,9 @@ It should be safe to create a proper named function and pass it to filter_if.
             op_idx = LazyLambda(f.__name__, idx_name, *args, **kwargs)
 
             if any(is_lambda(arg) for arg in args):
-                logging.warning(msg.format(method=f.__name__))
+                _log.warning(msg.format(method=f.__name__))
             if any(is_lambda(arg) for arg in kwargs.values()):
-                logging.warning(msg.format(method=f.__name__))
+                _log.warning(msg.format(method=f.__name__))
 
             return LazyTraffic(wrapped_t, [op_idx])
 

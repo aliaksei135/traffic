@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import ast
 import logging
-import sys
 import warnings
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
+from functools import lru_cache, reduce
+from itertools import combinations
 from operator import attrgetter
 from pathlib import Path
 from typing import (
@@ -16,11 +16,13 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Literal,
     NoReturn,
     Optional,
     Set,
     Tuple,
     Type,
+    TypedDict,
     TypeVar,
     Union,
     cast,
@@ -28,12 +30,10 @@ from typing import (
 )
 
 import rich.repr
+from ipyleaflet import Map as LeafletMap
+from ipyleaflet import Polyline as LeafletPolyline
+from ipywidgets import HTML
 from rich.console import Console, ConsoleOptions, RenderResult
-
-if sys.version_info >= (3, 8):
-    from typing import Literal, TypedDict
-else:
-    from typing_extensions import Literal, TypedDict
 
 import numpy as np
 import numpy.typing as npt
@@ -45,7 +45,8 @@ from shapely.ops import transform
 
 from ..algorithms.douglas_peucker import douglas_peucker
 from ..algorithms.navigation import NavigationFeatures
-from ..algorithms.phases import FuzzyLogic
+from ..algorithms.openap import OpenAP
+from ..core.structure import Airport
 from ..core.types import ProgressbarType
 from . import geodesy as geo
 from .iterator import FlightIterator, flight_iterator
@@ -54,15 +55,20 @@ from .time import deltalike, time_or_delta, timelike, to_datetime, to_timedelta
 
 if TYPE_CHECKING:
     import altair as alt  # noqa: F401
+    from cartopy import crs  # noqa: F401
     from cartopy.mpl.geoaxes import GeoAxesSubplot  # noqa: F401
     from matplotlib.artist import Artist  # noqa: F401
     from matplotlib.axes._subplots import Axes  # noqa: F401
 
     from ..data.adsb.raw_data import RawData  # noqa: F401
     from ..data.basic.aircraft import Tail  # noqa: F401
+    from ..data.basic.navaid import Navaids  # noqa: F401
     from .airspace import Airspace  # noqa: F401
     from .lazy import LazyTraffic  # noqa: F401
+    from .structure import Navaid  # noqa: F401
     from .traffic import Traffic  # noqa: F401
+
+_log = logging.getLogger(__name__)
 
 
 class Entry(TypedDict, total=False):
@@ -113,7 +119,7 @@ def _split(
         delta = np.timedelta64(value, unit)
     # There seems to be a change with numpy >= 1.18
     # max() now may return NaN, therefore the following fix
-    max_ = np.nanmax(diff)  # type: ignore
+    max_ = np.nanmax(diff)
     if max_ > delta:
         # np.nanargmax seems bugged with timestamps
         argmax = np.where(diff == max_)[0][0]
@@ -198,7 +204,7 @@ class Flight(
     GeographyMixin,
     ShapelyMixin,
     NavigationFeatures,
-    FuzzyLogic,
+    OpenAP,
     metaclass=MetaFlight,
 ):
     """Flight is the most basic class associated to a trajectory.
@@ -492,8 +498,25 @@ class Flight(
             raise AttributeError(msg)
         return getattr(self.data[feature], agg)()
 
+    def pipe(
+        self,
+        func: Callable[..., None | "Flight" | bool],
+        *args: Any,
+        **kwargs: Any,
+    ) -> None | "Flight" | bool:
+        """
+        Applies `func` to the object.
+
+        .. warning::
+
+            The logic is similar to that of :meth:`~pandas.DataFrame.pipe`
+            method, but the function applies on T, not on the DataFrame.
+
+        """
+        return func(self, *args, **kwargs)
+
     def filter_if(self, test: Callable[["Flight"], bool]) -> Optional["Flight"]:
-        # TODO deprecate if pipe() does a good job?
+        _log.warning("Use Flight.pipe(...) instead", DeprecationWarning)
         return self if test(self) else None
 
     def has(
@@ -814,9 +837,7 @@ class Flight(
         if len(tmp) == 1:
             return tmp[0]  # type: ignore
         if warn:
-            logging.warning(
-                f"Several {field}s for one flight, consider splitting"
-            )
+            _log.warning(f"Several {field}s for one flight, consider splitting")
         return set(tmp)
 
     @property
@@ -973,6 +994,10 @@ class Flight(
     def registration(self) -> Optional[str]:
         from ..data import aircraft
 
+        reg = self._get_unique("registration")
+        if isinstance(reg, str):
+            return reg
+
         if not isinstance(self.icao24, str):
             return None
         res = aircraft.get_unique(self.icao24)
@@ -983,6 +1008,10 @@ class Flight(
     @property
     def typecode(self) -> Optional[str]:
         from ..data import aircraft
+
+        tc = self._get_unique("typecode")
+        if isinstance(tc, str):
+            return tc
 
         if not isinstance(self.icao24, str):
             return None
@@ -1162,7 +1191,7 @@ class Flight(
         df = self.data.set_index("timestamp")
         if index not in df.index:
             id_ = getattr(self, "flight_id", self.callsign)
-            logging.warning(f"No index {index} for flight {id_}")
+            _log.warning(f"No index {index} for flight {id_}")
             return None
         return Position(df.loc[index])
 
@@ -1220,7 +1249,7 @@ class Flight(
     def split(  # noqa: F811
         self, value: Union[int, str] = 10, unit: Optional[str] = None
     ) -> Iterator["Flight"]:
-        """Iterates on legs of a Flight based on the distrution of timestamps.
+        """Iterates on legs of a Flight based on the distribution of timestamps.
 
         By default, the method stops a flight and yields a new one after a gap
         of 10 minutes without data.
@@ -1416,6 +1445,7 @@ class Flight(
         self,
         rule: str | int = "1s",
         how: str | dict[str, Iterable[str]] = "interpolate",
+        projection: None | str | pyproj.Proj | "crs.Projection" = None,
     ) -> "Flight":
         """Resample the trajectory at a given frequency or for a target number
         of samples.
@@ -1437,7 +1467,27 @@ class Flight(
               ``"interpolate"``, ``"ffill"``) and names of columns as values.
               Columns not included in any value are left as is.
 
+        :param projection: (default: ``None``)
+
+            - By default, lat/lon are resampled with a linear interpolation;
+            - If a projection is passed, the linear interpolation is applied on
+              the x and y dimensions, then lat/lon are reprojected back;
+            - If the projection is a string parameter, e.g. ``"lcc"``, a
+              projection is created on the fly, centred on the trajectory. This
+              approach is helpful to fill gaps along a great circle.
+
         """
+        if projection is not None:
+            if isinstance(projection, str):
+                projection = pyproj.Proj(
+                    proj=projection,
+                    ellps="WGS84",
+                    lat_1=self.data.latitude.min(),
+                    lat_2=self.data.latitude.max(),
+                    lat_0=self.data.latitude.mean(),
+                    lon_0=self.data.longitude.mean(),
+                )
+            self = self.compute_xy(projection=projection)
 
         if isinstance(rule, str):
             data = (
@@ -1483,7 +1533,12 @@ class Flight(
         if "heading_unwrapped" in data.columns:
             data = data.assign(heading=lambda df: df.heading_unwrapped % 360)
 
-        return self.__class__(data)
+        res = self.__class__(data)
+
+        if projection is not None:
+            res = res.compute_latlon_from_xy(projection=projection)
+
+        return res
 
     def filter(
         self,
@@ -1743,13 +1798,37 @@ class Flight(
             series = reset.data[feature].astype(float)
             idx = ~series.isnull()
             result_dict[f"{feature}_unwrapped"] = pd.Series(
-                np.degrees(
-                    np.unwrap(np.radians(series.loc[idx]))  # type: ignore
-                ),
+                np.degrees(np.unwrap(np.radians(series.loc[idx]))),
                 index=series.loc[idx].index,
             )
 
         return reset.assign(**result_dict)
+
+    def compute_TAS(self) -> "Flight":
+        """Computes the wind triangle for each timestamp.
+
+        This method requires ``groundspeed``, ``track``, ``wind_u`` and
+        ``wind_v`` (in knots) to compute true airspeed (``TAS``), and
+        ``heading`` features. The groundspeed and the track angle are usually
+        available in ADS-B messages; wind information may be included from a
+        GRIB file using the :meth:`~traffic.core.Flight.include_grib` method.
+
+        """
+
+        if any(w not in self.data.columns for w in ["wind_u", "wind_v"]):
+            raise RuntimeError(
+                "No wind data in trajectory. Consider Flight.include_grib()"
+            )
+
+        return self.assign(
+            tas_x=lambda df: df.groundspeed * np.sin(np.radians(df.track))
+            - df.wind_u,
+            tas_y=lambda df: df.groundspeed * np.cos(np.radians(df.track))
+            - df.wind_v,
+            TAS=lambda df: np.abs(df.tas_x + 1j * df.tas_y),
+            heading_rad=lambda df: np.angle(df.tas_x + 1j * df.tas_y),
+            heading=lambda df: (90 - np.degrees(df.heading_rad)) % 360,
+        ).drop(columns=["tas_x", "tas_y", "heading_rad"])
 
     def compute_wind(self) -> "Flight":
         """Computes the wind triangle for each timestamp.
@@ -1806,7 +1885,7 @@ class Flight(
 
         .. code:: python
 
-            from traffic.drawing import Mercator
+            from cartes.crs import Mercator
             fig, ax = plt.subplots(1, subplot_kw=dict(projection=Mercator()))
             (
                 flight
@@ -2006,7 +2085,7 @@ class Flight(
                         * (-1 if projected_shape.contains(p) else 1)
                         for p in MultiPoint(
                             list(zip(self_xy.data.x, self_xy.data.y))
-                        )
+                        ).geoms
                     )
                 }
             )
@@ -2032,6 +2111,113 @@ class Flight(
             )
             / 1852,  # in nautical miles
             vertical=(table.altitude_x - table.altitude_y).abs(),
+        )
+
+    def compute_DME_NSE(
+        self,
+        dme: "Navaids" | Tuple["Navaid", "Navaid"],
+        column_name: str = "NSE",
+    ) -> "Flight":
+        """Adds the DME/DME Navigation System Error.
+
+        Computes the max Navigation System Error using DME-DME navigation. The
+        obtained NSE value corresponds to the 2 :math:`\\sigma` (95%)
+        requirement in nautical miles.
+
+        Source: EUROCONTROL Guidelines for RNAV 1 Infrastructure Assessment
+
+        :param dme:
+
+            - when the parameter is of type Navaids, only the pair of Navaid
+              giving the smallest NSE are used;
+            - when the parameter is of type tuple, the NSE is computed using
+              only the pair of specified Navaid.
+
+        :param column_name: (default: ``"NSE"``), the name of the new column
+            containing the computed NSE
+
+        """
+
+        from ..data.basic.navaid import Navaids
+
+        sigma_dme_1_sis = sigma_dme_2_sis = 0.05
+
+        def sigma_air(df: pd.DataFrame, column_name: str) -> Any:
+            values = df[column_name] * 0.125 / 100
+            return np.where(values < 0.085, 0.085, values)
+
+        def angle_from_bearings_deg(
+            bearing_1: float, bearing_2: float
+        ) -> float:
+            # Returns the subtended given by 2 bearings.
+            angle = np.abs(bearing_1 - bearing_2)
+            return np.where(angle > 180, 360 - angle, angle)  # type: ignore
+
+        if isinstance(dme, Navaids):
+            flight = reduce(
+                lambda flight, dme_pair: flight.compute_DME_NSE(
+                    dme_pair, f"nse_{dme_pair[0].name}_{dme_pair[1].name}"
+                ),
+                combinations(dme, 2),
+                self,
+            )
+            nse_colnames = list(
+                column
+                for column in flight.data.columns
+                if column.startswith("nse_")
+            )
+            return (
+                flight.assign(
+                    NSE=lambda df: df[nse_colnames].min(axis=1),
+                    NSE_idx=lambda df: df[nse_colnames].idxmin(axis=1).str[4:],
+                )
+                .rename(
+                    columns=dict(
+                        NSE=column_name,
+                        NSE_idx=f"{column_name}_idx",
+                    )
+                )
+                .drop(columns=nse_colnames)
+            )
+
+        dme1, dme2 = dme
+        extra_cols = [
+            "b1",
+            "b2",
+            "d1",
+            "d2",
+            "sigma_dme_1_air",
+            "sigma_dme_2_air",
+            "angle",
+        ]
+
+        return (
+            self.distance(dme1, "d1")
+            .bearing(dme1, "b1")
+            .distance(dme2, "d2")
+            .bearing(dme2, "b2")
+            .assign(angle=lambda df: angle_from_bearings_deg(df.b1, df.b2))
+            .assign(
+                angle=lambda df: np.where(
+                    (df.angle >= 30) & (df.angle <= 150), df.angle, np.nan
+                )
+            )
+            .assign(
+                sigma_dme_1_air=lambda df: sigma_air(df, "d1"),
+                sigma_dme_2_air=lambda df: sigma_air(df, "d2"),
+                NSE=lambda df: (
+                    2
+                    * np.sqrt(
+                        df.sigma_dme_1_air**2
+                        + df.sigma_dme_2_air**2
+                        + sigma_dme_1_sis**2
+                        + sigma_dme_2_sis**2
+                    )
+                )
+                / np.sin(np.deg2rad(df.angle)),
+            )
+            .drop(columns=extra_cols)
+            .rename(columns=dict(NSE=column_name))
         )
 
     def cumulative_distance(
@@ -2070,36 +2256,30 @@ class Flight(
         delta = pd.concat([coords, coords.add_suffix("_1").diff()], axis=1)
         delta_1 = delta.iloc[1:]
         d = geo.distance(
+            (delta_1.latitude - delta_1.latitude_1).values,
+            (delta_1.longitude - delta_1.longitude_1).values,
             delta_1.latitude.values,
             delta_1.longitude.values,
-            (delta_1.latitude + delta_1.latitude_1).values,
-            (delta_1.longitude + delta_1.longitude_1).values,
         )
 
         res = cur_sorted.assign(
-            cumdist=np.pad(  # type: ignore
-                d.cumsum() / 1852, (1, 0), "constant"
-            )
+            cumdist=np.pad(d.cumsum() / 1852, (1, 0), "constant")
         )
 
         if compute_gs:
             gs = d / delta_1.timestamp_1.dt.total_seconds() * (3600 / 1852)
-            res = res.assign(
-                compute_gs=np.abs(np.pad(gs, (1, 0), "edge"))  # type: ignore
-            )
+            res = res.assign(compute_gs=np.abs(np.pad(gs, (1, 0), "edge")))
 
         if compute_track:
             track = geo.bearing(
+                (delta_1.latitude - delta_1.latitude_1).values,
+                (delta_1.longitude - delta_1.longitude_1).values,
                 delta_1.latitude.values,
                 delta_1.longitude.values,
-                (delta_1.latitude + delta_1.latitude_1).values,
-                (delta_1.longitude + delta_1.longitude_1).values,
             )
             track = np.where(track > 0, track, 360 + track)
             res = res.assign(
-                compute_track=np.abs(
-                    np.pad(track, (1, 0), "edge")  # type: ignore
-                )
+                compute_track=np.abs(np.pad(track, (1, 0), "edge"))
             )
 
         return res.sort_values("timestamp", ascending=True)
@@ -2135,9 +2315,9 @@ class Flight(
 
         The method uses latitude and longitude, projects the trajectory to a
         conformal projection and applies the algorithm. If x and y features are
-        already present in the DataFrame (after a call to `compute_xy()
-        <#traffic.core.Flight.compute_xy>`_ for instance) then this projection
-        is taken into account.
+        already present in the DataFrame (after a call to
+        :ref:`~traffic.core.Flight.compute_xy()` for instance) then this
+        projection is taken into account.
 
         The tolerance parameter must be defined in meters.
 
@@ -2366,7 +2546,7 @@ class Flight(
             id_ = self.flight_id
             if id_ is None:
                 id_ = self.callsign
-            logging.warning(f"No data on Impala for flight {id_}.")
+            _log.warning(f"No data on Impala for flight {id_}.")
             return self
 
         def fail_silent() -> "Flight":
@@ -2455,6 +2635,89 @@ class Flight(
 
     # -- Visualisation --
 
+    def leaflet(self, **kwargs: Any) -> Optional[LeafletPolyline]:
+        """Returns a Leaflet layer to be directly added to a Map.
+
+        The elements passed as kwargs as passed as is to the PolyLine
+        constructor.
+
+        Example usage:
+
+        >>> from ipyleaflet import Map
+        >>> # Center the map near the landing airport
+        >>> m = Map(center=flight.at().latlon, zoom=7)
+        >>> m.add_layer(flight)  # this works as well with default options
+        >>> m.add_layer(flight.leaflet(color='red'))
+        >>> m
+        """
+        shape = self.shape
+        if shape is None:
+            return None
+
+        kwargs = {**dict(fill_opacity=0, weight=3), **kwargs}
+        return LeafletPolyline(
+            locations=list((lat, lon) for (lon, lat, _) in shape.coords),
+            **kwargs,
+        )
+
+    def map_leaflet(
+        self,
+        *,
+        zoom: int = 7,
+        highlight: Optional[
+            Dict[
+                str,
+                Union[str, Flight, Callable[[Flight], Optional[Flight]]],
+            ]
+        ] = None,
+        airport: Union[None, str, Airport] = None,
+        **kwargs: Any,
+    ) -> Optional[LeafletMap]:
+        from ..data import airports
+
+        last_position = self.query("latitude == latitude").at()  # type: ignore
+        if last_position is None:
+            return None
+
+        _airport = airports[airport] if isinstance(airport, str) else airport
+
+        if "center" not in kwargs:
+            if _airport is not None:
+                kwargs["center"] = _airport.latlon
+            else:
+                kwargs["center"] = (
+                    self.data.latitude.mean(),
+                    self.data.longitude.mean(),
+                )
+
+        m = LeafletMap(zoom=zoom, **kwargs)
+
+        if _airport is not None:
+            m.add_layer(_airport)
+
+        elt = m.add_layer(self)
+        elt.popup = HTML()
+        elt.popup.value = self._info_html()
+
+        if highlight is None:
+            highlight = dict()
+
+        for color, value in highlight.items():
+            if isinstance(value, str):
+                value = getattr(Flight, value, None)  # type: ignore
+                if value is None:
+                    continue
+            assert not isinstance(value, str)
+            f: Optional[Flight]
+            if isinstance(value, Flight):
+                f = value
+            else:
+                f = value(self)
+            if f is not None:
+                m.add_layer(f, color=color)
+
+        return m
+
     def plot(
         self, ax: "GeoAxesSubplot", **kwargs: Any
     ) -> List["Artist"]:  # coverage: ignore
@@ -2469,7 +2732,7 @@ class Flight(
 
         .. code:: python
 
-            from traffic.drawing import Mercator
+            from cartes.crs import Mercator
             fig, ax = plt.subplots(1, subplot_kw=dict(projection=Mercator())
             flight.plot(ax, alpha=.5)
 

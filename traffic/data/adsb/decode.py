@@ -7,7 +7,6 @@ import heapq
 import logging
 import os
 import socket
-import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -21,6 +20,7 @@ from typing import (
     Iterator,
     Optional,
     TextIO,
+    TypedDict,
     TypeVar,
     Union,
     cast,
@@ -34,15 +34,30 @@ import pandas as pd
 from ...core import Flight, Traffic
 from ...data.basic.airports import Airport
 
-if sys.version_info >= (3, 8):
-    from typing import TypedDict
-else:
-    from typing_extensions import TypedDict
-
 Decoder = TypeVar("Decoder", bound="ModeS_Decoder")
 
+_log = logging.getLogger(__name__)
 
-def next_msg(chunk_it: Iterator[bytes]) -> Iterator[bytes]:
+MSG_SIZES = {0x31: 11, 0x32: 16, 0x33: 23, 0x34: 23}
+
+
+def next_beast_msg(chunk_it: Iterator[bytes]) -> Iterator[bytes]:
+    """Iterate in Beast binary feed.
+
+    <esc> "1" : 6 byte MLAT timestamp, 1 byte signal level,
+        2 byte Mode-AC
+    <esc> "2" : 6 byte MLAT timestamp, 1 byte signal level,
+        7 byte Mode-S short frame
+    <esc> "3" : 6 byte MLAT timestamp, 1 byte signal level,
+        14 byte Mode-S long frame
+    <esc> "4" : 6 byte MLAT timestamp, status data, DIP switch
+        configuration settings (not on Mode-S Beast classic)
+    <esc><esc>: true 0x1a
+    <esc> is 0x1a, and "1", "2" and "3" are 0x31, 0x32 and 0x33
+
+    timestamp:
+    wiki.modesbeast.com/Radarcape:Firmware_Versions#The_GPS_timestamp
+    """
     data = b""
     for chunk in chunk_it:
         data += chunk
@@ -53,21 +68,28 @@ def next_msg(chunk_it: Iterator[bytes]) -> Iterator[bytes]:
             data = data[it:]
             if len(data) < 23:
                 break
-            if data[1] == 0x33:
-                yield data[:23]
-                data = data[23:]
-                continue
-            elif data[1] == 0x32:
-                data = data[16:]
-                continue
-            elif data[1] == 0x31:
-                data = data[11:]
-                continue
-            elif data[1] == 0x34:
-                data = data[23:]
-                continue
+
+            if data[1] in [0x31, 0x32, 0x33, 0x34]:
+                # The tricky part here is to collapse all 0x1a 0x1a into single
+                # 0x1a when they are part of a message (i.e. not followed by
+                # "1", "2", "3" or "4")
+                msg_size = MSG_SIZES[data[1]]
+                ref_idx = 1
+                idx = data[ref_idx:msg_size].find(0x1A)
+                while idx != -1 and len(data) > msg_size:
+                    start = ref_idx + idx
+                    ref_idx = start + 1
+                    if data[ref_idx] == 0x1A:
+                        data = data[:start] + data[ref_idx:]
+                    idx = data[ref_idx:msg_size].find(0x1A)
+                if idx != -1 or len(data) < msg_size:
+                    # calling for next buffer
+                    break
+                yield data[:msg_size]
+                data = data[msg_size:]
             else:
                 data = data[1:]
+                _log.warning("Probably corrupted message")
 
 
 def decode_time_default(
@@ -86,9 +108,11 @@ def decode_time_radarcape(
 
     nanos = timestamp & 0x00003FFFFFFF
     secs = timestamp >> 30
-    now = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    now += timedelta(seconds=secs, microseconds=nanos / 1000)
-    return now
+    ts = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    ts += timedelta(seconds=secs, microseconds=nanos / 1000)
+    if ts - timedelta(minutes=5) > now:
+        ts -= timedelta(days=1)
+    return ts
 
 
 def decode_time_dump1090(
@@ -120,7 +144,7 @@ class StoppableThread(threading.Thread):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self.daemon = True  # is it redundant?
+        # self.daemon = True  # is it redundant?
         self._stop_event = threading.Event()
 
     def stop(self) -> None:
@@ -226,7 +250,10 @@ class Aircraft(object):
             self.cumul.clear()
 
         if self._flight is not None:
-            df = pd.concat([self._flight.data, df], sort=False)
+            if len(df) > 0:
+                df = pd.concat([self._flight.data, df], sort=False)
+            else:
+                df = self._flight.data
             if self.version is not None:
                 # remove columns added by nuc_p, nuc_r
                 if "HPL" in df.columns:
@@ -237,13 +264,16 @@ class Aircraft(object):
         if len(df) == 0:
             return None
 
-        self._flight = Flight(
-            df.assign(
-                callsign=df.callsign.replace("", None)
-                .fillna(method="ffill")
-                .fillna(method="bfill")
+        if "callsign" in set(df.columns):
+            self._flight = Flight(
+                df.assign(
+                    callsign=df.callsign.replace("", None)
+                    .fillna(method="ffill")
+                    .fillna(method="bfill")
+                )
             )
-        )
+        else:
+            self._flight = Flight(df.assign(callsign=None))
 
         return self._flight
 
@@ -350,7 +380,12 @@ class Aircraft(object):
         )
         speed, track, _, speed_type, *_ = pms.adsb.surface_velocity(msg)
         if speed_type != "GS":
-            logging.warn(f"Ground airspeed for aircraft {self.icao24}")
+            _log.warn(f"Ground airspeed for aircraft {self.icao24}")
+
+        # This helps updating current representations
+        self.spd = speed
+        self.trk = track
+
         with self.lock:
             self.cumul.append(
                 dict(
@@ -418,9 +453,10 @@ class Aircraft(object):
             # or squawk from idcode (DF5 or 21)
             last_entry = self.cumul[-1] if len(self.cumul) > 0 else None
             if last_entry is not None and last_entry["timestamp"] == t:
-                self.cumul[-1] = dict(  # type: ignore
-                    **last_entry, callsign=self._callsign
-                )
+                self.cumul[-1] = {  # type: ignore
+                    **last_entry,
+                    **dict(callsign=self._callsign),
+                }
             else:
                 self.cumul.append(
                     dict(
@@ -862,7 +898,7 @@ class AircraftDict(Dict[str, Aircraft]):
     def set_latlon(self, lat0: float, lon0: float) -> None:
         self.lat0 = lat0
         self.lon0 = lon0
-        for ac in self.values():
+        for ac in list(self.values()):
             ac.lat0 = lat0
             ac.lon0 = lon0
 
@@ -918,7 +954,7 @@ class ModeS_Decoder:
 
         The :meth:`from_address`, :meth:`from_dump1090`, and :meth:`from_rtlsdr`
         classmethods start a decoding thread on the creation of the object.  The
-        thread can be stopped with a ``decoder.thread.stop()`` call.
+        thread can be stopped with a ``decoder.stop()`` call.
 
     :param reference: A reference location must be provided to decode ground
         messages. A reference can be set as:
@@ -952,7 +988,7 @@ class ModeS_Decoder:
             reference = airports[reference]
 
         if reference is None:
-            logging.warning(
+            _log.warning(
                 "No valid reference position provided. Fallback to (0, 0)"
             )
             lat0, lon0 = 0.0, 0.0
@@ -990,7 +1026,7 @@ class ModeS_Decoder:
         def decorate(
             function: Callable[[Decoder], None]
         ) -> Callable[[Decoder], None]:
-            logging.info(f"Schedule {function.__name__} with {frequency}")
+            _log.info(f"Schedule {function.__name__} with {frequency}")
             heapq.heappush(
                 cls.timer_functions,
                 (now + frequency, frequency, function),
@@ -1000,7 +1036,7 @@ class ModeS_Decoder:
         return decorate
 
     def expire_aircraft(self) -> None:
-        logging.info("Running expire_aircraft")
+        _log.info("Running expire_aircraft")
 
         now = pd.Timestamp("now", tz="utc")
 
@@ -1016,11 +1052,7 @@ class ModeS_Decoder:
                 if now - ac.cumul[-1]["timestamp"] >= self.expire_threshold:
                     self.on_expire_aircraft(icao)
             else:
-                try:  # TODO why?
-                    flight = ac.flight
-                except Exception:
-                    flight = None
-
+                flight = ac.flight
                 if flight is not None:
                     if now - flight.stop >= self.expire_threshold:
                         self.on_expire_aircraft(icao)
@@ -1030,8 +1062,7 @@ class ModeS_Decoder:
             del self.acs[icao]
 
     def on_new_aircraft(self, icao: str) -> None:
-        print(self, icao)
-        logging.info(f"New aircraft {icao}")
+        _log.info(f"New aircraft {icao}")
 
     @classmethod
     def from_file(
@@ -1117,7 +1148,9 @@ class ModeS_Decoder:
         # We don't know the size of the binary so tqdm.rich does not work
         from tqdm.autonotebook import tqdm
 
-        for i, bin_msg in tqdm(enumerate(next_msg(next_in_binary(filename)))):
+        for i, bin_msg in tqdm(
+            enumerate(next_beast_msg(next_in_binary(filename)))
+        ):
 
             if len(bin_msg) < 23:
                 continue
@@ -1182,7 +1215,7 @@ class ModeS_Decoder:
     @classmethod
     def from_socket(
         cls,
-        socket: socket.socket,
+        s: socket.socket,
         reference: Union[str, Airport, tuple[float, float]],
         *,
         uncertainty: bool,
@@ -1196,18 +1229,41 @@ class ModeS_Decoder:
         redefine_freq = 2**redefine_mag - 1
         decode_time_here = decode_time.get(time_fmt, decode_time_default)
 
-        def next_in_socket() -> Iterator[bytes]:
+        def next_in_tcp_socket() -> Iterator[bytes]:
+            while True:
+                data = s.recv(2048)
+                if (
+                    decoder.decode_thread is None
+                    or decoder.decode_thread.to_be_stopped()
+                    or len(data) == 0  # connection dropped
+                ):
+                    _log.warning("Connection dropped or decoder stopped")
+                    s.close()
+                    decoder.stop()
+                    return
+                yield data
+
+        def next_in_udp_socket() -> Iterator[bytes]:
             while True:
                 if (
                     decoder.decode_thread is None
                     or decoder.decode_thread.to_be_stopped()
                 ):
-                    socket.close()
+                    s.close()
+                    _log.warning("getting out of UDP socket")
                     return
-                yield socket.recv(2048)
+                data, _addr = s.recvfrom(1024)
+                yield data
+
+        next_in_socket = {
+            socket.SOCK_STREAM: next_in_tcp_socket,
+            socket.SOCK_DGRAM: next_in_udp_socket,
+        }
 
         def decode() -> None:
-            for i, bin_msg in enumerate(next_msg(next_in_socket())):
+            for i, bin_msg in enumerate(
+                next_beast_msg(next_in_socket[s.type]())
+            ):
 
                 msg = "".join(["{:02x}".format(t) for t in bin_msg])
 
@@ -1235,7 +1291,7 @@ class ModeS_Decoder:
             cls.on_timer(decoder.expire_frequency)(cls.expire_aircraft)
 
             # if the decoder is not alive, finish expiring aircraft
-            while decoder.decode_thread.is_alive() or len(decoder.acs) != 0:
+            while decoder.decode_thread.is_alive():
                 now = pd.Timestamp("now", tz="utc")
                 t, delta, operation = heapq.heappop(cls.timer_functions)
 
@@ -1245,7 +1301,7 @@ class ModeS_Decoder:
 
                 now = pd.Timestamp("now", tz="utc")
                 operation(decoder)
-                logging.info(f"Schedule {operation.__name__} at {now + delta}")
+                _log.info(f"Schedule {operation.__name__} at {now + delta}")
                 heapq.heappush(
                     cls.timer_functions, (now + delta, delta, operation)
                 )
@@ -1259,7 +1315,7 @@ class ModeS_Decoder:
     def stop(self) -> None:
         if self.decode_thread is not None and self.decode_thread.is_alive():
             self.decode_thread.stop()
-            self.decode_thread.join()
+            self.timer_thread.join()
 
     def __del__(self) -> None:
         self.stop()
@@ -1315,8 +1371,9 @@ class ModeS_Decoder:
         file_pattern: str = "~/ADSB_EHS_RAW_%Y%m%d_tcp.csv",
         time_fmt: str = "radarcape",
         uncertainty: bool = False,
+        tcp: bool = True,
     ) -> "ModeS_Decoder":  # coverage: ignore
-        """Decode raw messages transmitted over a TCP network.
+        """Decode raw messages transmitted over a TCP or UDP network.
 
         The file should contain for each line at least a timestamp and an
         hexadecimal message, as a CSV-like format.
@@ -1350,8 +1407,12 @@ class ModeS_Decoder:
         now = datetime.now(timezone.utc)
         filename = now.strftime(file_pattern)
         today = os.path.expanduser(filename)
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.connect((host, port))
+        if tcp:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((host, port))
+        else:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.bind((host, port))
         fh = open(today, "a", 1)
         return cls.from_socket(
             s, reference, uncertainty=uncertainty, time_fmt=time_fmt, fh=fh
@@ -1360,7 +1421,7 @@ class ModeS_Decoder:
     def redefine_reference(self, time: datetime) -> None:
         pos = list(
             (ac.lat, ac.lon)
-            for ac in self.acs.values()
+            for ac in list(self.acs.values())
             if ac.alt is not None
             and ac.alt < 5000
             and ac.tpos is not None
@@ -1536,7 +1597,8 @@ class ModeS_Decoder:
                     position=ac.lat is not None,
                     data=ac,
                 )
-                for (key, ac) in self.acs.items()
+                # avoid dictionary change size during iteration
+                for (key, ac) in list(self.acs.items())
                 if ac.callsign is not None
             ),
             key=itemgetter("length"),
@@ -1554,8 +1616,11 @@ class ModeS_Decoder:
             return Traffic.from_flights(
                 self[elt["icao24"]] for elt in self.aircraft
             )
-        except ValueError:
+        except ValueError as e:
+            _log.warning(e)
             return None
 
     def __getitem__(self, icao: str) -> Optional[Flight]:
-        return self.acs[icao].flight
+        with self.acs[icao].lock:
+            ac = self.acs[icao]
+        return ac.flight

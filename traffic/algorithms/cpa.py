@@ -1,6 +1,15 @@
 import logging
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import TYPE_CHECKING, Iterator, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Iterator,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+    cast,
+)
 
 from tqdm.rich import tqdm
 
@@ -14,6 +23,8 @@ if TYPE_CHECKING:
     from cartopy import crs
 
     from ..core import Traffic
+
+_log = logging.getLogger(__name__)
 
 
 def combinations(
@@ -90,16 +101,24 @@ class CPA(DataFrameMixin):
             rename_cols["flight_id_x"] = "flight_id_y"
             rename_cols["flight_id_y"] = "flight_id_x"
 
-            res = df.query("flight_id_y == @index").append(
-                df.query("flight_id_x == @index").rename(columns=rename_cols),
+            res = pd.concat(
+                [
+                    df.query("flight_id_y == @index"),
+                    df.query("flight_id_x == @index").rename(
+                        columns=rename_cols
+                    ),
+                ],
                 sort=False,
             )
 
             if res.shape[0] > 0:
                 return self.__class__(res)
 
-        res = df.query("icao24_y == @index").append(
-            df.query("icao24_x == @index").rename(columns=rename_cols),
+        res = pd.concat(
+            [
+                df.query("icao24_y == @index"),
+                df.query("icao24_x == @index").rename(columns=rename_cols),
+            ],
             sort=False,
         )
 
@@ -150,7 +169,7 @@ def closest_point_of_approach(
     from cartopy import crs
 
     if projection is None:
-        logging.warn("Defaulting to projection EuroPP()")
+        _log.warn("Defaulting to projection EuroPP()")
         projection = crs.EuroPP()
 
     if isinstance(projection, crs.Projection):
@@ -205,7 +224,11 @@ def closest_point_of_approach(
     ):
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             tasks = {
-                executor.submit(Flight.distance, first, second): (
+                executor.submit(
+                    cast(Callable[[Flight, Flight], Flight], Flight.distance),
+                    first,
+                    second,  # typing: ignore
+                ): (
                     first.icao24,
                     second.icao24,
                 )

@@ -15,7 +15,7 @@ basic functionalities of the traffic library. In particular, we will cover:
 .. tip::
 
     This page is also available as a notebook which can be
-    :jupyter-download:notebook:`downloaded <quickstart>` and executed locally;
+    :jupyter-download-notebook:`downloaded <quickstart>` and executed locally;
     or loaded and executed in `Google Colab
     <https://colab.research.google.com/>`__.
 
@@ -285,7 +285,7 @@ visualisation renderers including `Matplotlib <https://matplotlib.org/>`_ and
             *(
                 flight.chart().encode(
                     alt.X(
-                        "utchoursminutesseconds(timestamp)",
+                        "utcdayhoursminutesseconds(timestamp)",
                         axis=alt.Axis(format="%H:%M"),
                         title=None,
                     ),
@@ -305,9 +305,7 @@ Making maps
 -----------
 
 Maps are also available with Matplotlib, Altair, and thanks to `ipyleaflet
-<https://ipyleaflet.readthedocs.io/>`_ widgets, if the corresponding
-:ref:`plugin <How to use and write plugins for the traffic library?>` is
-activated (true by default)
+<https://ipyleaflet.readthedocs.io/>`_ widgets.
 
 - with Matplotlib, you need to specify a projection for your axis system. They
   are provided by `cartes <https://cartes-viz.github.io/projections.html>`_ on
@@ -356,11 +354,11 @@ activated (true by default)
     chart
 
 - for quick interactive representations **with few elements**, the
-  :ref:`Leaflet` widget is a good option:
+  Leaflet widget is a good option:
 
   .. jupyter-execute::
 
-    subset.map_leaflet(zoom=9)
+    subset.map_leaflet(zoom=8)
 
 
 Low-altitude trajectory patterns in Paris metropolitan area
@@ -490,7 +488,7 @@ matching, and extract relevant information (the runway information):
     chart = (
         alt.Chart(stats)
         .encode(
-            alt.X("utchoursminutes(stop)", axis=alt.Axis(format="%H:%M"), title=None),
+            alt.X("utcdayhoursminutesseconds(stop)", axis=alt.Axis(format="%H:%M"), title=None),
             alt.Y("ILS", title=None),
             alt.Color("ILS", legend=None),
             alt.Row("airport", title=None),

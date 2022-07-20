@@ -104,6 +104,8 @@ nmb2b_version = config.get("nmb2b", "version", fallback="25.0.0")
 
 _cached_imports: Dict[str, Any] = dict()
 
+_log = logging.getLogger(__name__)
+
 
 def __getattr__(name: str) -> Any:
 
@@ -160,7 +162,7 @@ def __getattr__(name: str) -> Any:
         from cartes.osm.requests import session as carto_session
 
         if len(proxy_values) > 0:
-            carto_session.proxies.update(proxy_values)  # type: ignore
+            carto_session.proxies.update(proxy_values)
             carto_session.trust_env = False
 
         res = carto_session
@@ -284,7 +286,7 @@ def __getattr__(name: str) -> Any:
 
         session = Session()
         if len(proxy_values) > 0:
-            session.proxies.update(proxy_values)  # type: ignore
+            session.proxies.update(proxy_values)
             session.trust_env = False
         res = session
         _cached_imports[name] = res
@@ -295,7 +297,7 @@ def __getattr__(name: str) -> Any:
         from .eurocontrol.b2b import NMB2B
 
         if pkcs12_filename != "" and pkcs12_password != "":
-            logging.debug(f"pcks12_filename: {pkcs12_filename}")
+            _log.debug(f"pcks12_filename: {pkcs12_filename}")
             nm_b2b = NMB2B(
                 getattr(NMB2B, nmb2b_mode),
                 nmb2b_version,

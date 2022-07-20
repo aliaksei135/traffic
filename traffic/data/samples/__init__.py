@@ -1,4 +1,3 @@
-import sys
 import types
 from functools import lru_cache
 from pathlib import Path
@@ -20,8 +19,8 @@ def get_flight(filename: str, directory: Path) -> Union[Flight, Traffic]:
     )
     if flight is None:
         raise RuntimeError(f"File {filename}.json.gz not found in {directory}")
-    icao24 = set(flight.data.icao24)
-    if len(icao24) == 1:
+    icao24 = set(flight.data.icao24) if "icao24" in flight.data.columns else []
+    if len(icao24) <= 1:
         if Flight(flight.data).split("1H").sum() == 1:
             # easier way to cast...
             flight = Flight(flight.data)
@@ -44,10 +43,7 @@ def get_flight(filename: str, directory: Path) -> Union[Flight, Traffic]:
 def get_sample(
     module: types.ModuleType, name: str
 ) -> Union[None, "Flight", "Traffic"]:
-    if sys.version_info >= (3, 7):
-        return getattr(module, name)  # type: ignore
-    path = Path(module.__file__).parent
-    return get_flight(name, path)
+    return getattr(module, name)  # type: ignore
 
 
 def assign_id(t: Union[Traffic, Flight], name: str) -> Union[Traffic, Flight]:

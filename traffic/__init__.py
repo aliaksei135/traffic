@@ -10,8 +10,13 @@ from appdirs import user_cache_dir, user_config_dir
 
 import pandas as pd
 
+from . import drawing  # noqa: F401
+
 __version__ = importlib_metadata.version("traffic")  # type: ignore
 __all__ = ["config_dir", "config_file", "cache_dir"]
+
+# Set up the library root logger
+_log = logging.getLogger(__name__)
 
 # -- Configuration management --
 
@@ -65,7 +70,9 @@ cache_expiration_cfg = config.get("cache", "expiration", fallback="180 days")
 cache_expiration = pd.Timedelta(cache_expiration_cfg)
 
 cache_purge_cfg = config.get("cache", "purge", fallback="")
-if cache_purge_cfg != "":
+cache_no_expire = bool(os.environ.get("TRAFFIC_CACHE_NO_EXPIRE"))
+
+if cache_purge_cfg != "" and not cache_no_expire:
     cache_purge = pd.Timedelta(cache_purge_cfg)
     now = pd.Timestamp("now").timestamp()
 
@@ -76,7 +83,7 @@ if cache_purge_cfg != "":
     )
 
     if len(purgeable) > 0:
-        logging.warn(
+        _log.warn(
             f"Removing {len(purgeable)} cache files older than {cache_purge}"
         )
         for path in purgeable:
@@ -93,13 +100,14 @@ _enabled_list = ",".join(_enabled_plugins_raw.split("\n")).split(",")
 _selected = set(s.replace("-", "").strip().lower() for s in _enabled_list)
 _selected -= {""}
 
-logging.info(f"Selected plugins: {_selected}")
+_log.info(f"Selected plugins: {_selected}")
 
 if "TRAFFIC_NOPLUGIN" not in os.environ.keys():  # coverage: ignore
     for entry_point in pkg_resources.iter_entry_points("traffic.plugins"):
         if entry_point.name.replace("-", "").lower() in _selected:
+            _log.info(f"Loading plugin: {entry_point.name}")
             handle = entry_point.load()
-            logging.info(f"Loading plugin: {handle.__name__}")
+            _log.info(f"Loaded plugin: {handle.__name__}")
             load = getattr(handle, "_onload", None)
             if load is not None:
                 load()
